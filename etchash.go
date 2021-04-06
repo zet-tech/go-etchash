@@ -19,6 +19,7 @@
 package etchash
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -395,13 +396,13 @@ func (c *cache) finalizer() {
 	}
 }
 
-func (c *cache) compute(dagSize uint64, hash common.Hash, nonce uint64) (common.Hash, common.Hash) {
+func (c *cache) compute(dagSize uint64, hash common.Hash, nonce uint64) (bool, common.Hash, common.Hash) {
 	// ret := C.etchash_light_compute_internal(cache.ptr, C.uint64_t(dagSize), hashToH256(hash), C.uint64_t(nonce))
 	digest, result := hashimotoLight(dagSize, c.cache, hash.Bytes(), nonce)
 	// Caches are unmapped in a finalizer. Ensure that the cache stays alive
 	// until after the call to hashimotoLight so it's not unmapped while being used.
 	runtime.KeepAlive(c)
-	return common.BytesToHash(digest), common.BytesToHash(result)
+	return true, common.BytesToHash(digest), common.BytesToHash(result)
 }
 
 // Light implements the Verify half of the proof of work. It uses a few small
@@ -447,7 +448,7 @@ func (l *Light) Verify(block Block) bool {
 		dagSize = dagSizeForTesting
 	}
 	// Recompute the hash using the cache.
-	mixDigest, result := cache.compute(uint64(dagSize), block.HashNoNonce(), block.Nonce())
+	_, mixDigest, result := cache.compute(uint64(dagSize), block.HashNoNonce(), block.Nonce())
 
 	// avoid mixdigest malleability as it's not included in a block's "hashNononce"
 	if block.MixDigest() != mixDigest {
@@ -457,6 +458,63 @@ func (l *Light) Verify(block Block) bool {
 	// The actual check.
 	target := new(big.Int).Div(maxUint256, difficulty)
 	return result.Big().Cmp(target) <= 0
+}
+
+func (l *Light) ComputeMixDigest(blockNum uint64, hashNoNonce common.Hash, nonce uint64) (ok bool, mixDigest common.Hash, result common.Hash) {
+	cache := l.getCache(blockNum)
+	epochLength := calcEpochLength(blockNum, l.ecip1099FBlock)
+	epoch := calcEpoch(blockNum, epochLength)
+	dagSize := datasetSize(epoch)
+	// dagSize := C.ethash_get_datasize(C.uint64_t(blockNum))
+	return cache.compute(uint64(dagSize), hashNoNonce, nonce)
+}
+
+func le256todouble(target [32]byte) float64 {
+	var bits192 float64 = 6277101735386680763835789423207666416102355444464034512896.0
+	var bits128 float64 = 340282366920938463463374607431768211456.0
+	var bits64 float64 = 18446744073709551616.0
+	var dcut64 float64
+	var data64 uint64
+
+	buf := bytes.NewReader(target[24:32])
+	binary.Read(buf, binary.LittleEndian, &data64)
+	dcut64 = float64(data64) * bits192
+
+	buf = bytes.NewReader(target[16:24])
+	binary.Read(buf, binary.LittleEndian, &data64)
+	dcut64 += float64(data64) * bits128
+
+	buf = bytes.NewReader(target[8:16])
+	binary.Read(buf, binary.LittleEndian, &data64)
+	dcut64 += float64(data64) * bits64
+
+	buf = bytes.NewReader(target[0:16])
+	binary.Read(buf, binary.LittleEndian, &data64)
+	dcut64 += float64(data64)
+
+	return dcut64
+}
+
+func shareDiff(h [32]byte) float64 {
+	var truediffone float64 = 26959535291011309493156476344723991336010898738574164086137773096960.0
+	var s64 float64
+
+	var hash_end [32]byte
+	for i := 0; i < 32; i++ {
+		hash_end[31-i] = h[i]
+	}
+
+	s64 = le256todouble(hash_end)
+	if s64 <= 0 {
+		return 0.0
+	}
+	return truediffone / s64
+}
+
+func (l *Light) GetShareDiff(h common.Hash) (diff float64) {
+	var b [32]byte
+	copy(b[:], h.Bytes())
+	return shareDiff(b)
 }
 
 func (l *Light) getCache(blockNum uint64) *cache {
